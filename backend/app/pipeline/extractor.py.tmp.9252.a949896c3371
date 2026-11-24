@@ -1,0 +1,242 @@
+"""Orchestrates Task 2: split a document into invoice segments, extract each one.
+
+Strategy per text segment:
+  1. Rule-based extraction always runs (cheap, deterministic).
+  2. If an Anthropic key is configured, Claude extracts the same segment.
+  3. The LLM result is *grounded*: each value must be findable in the source text; values
+     that are not found, or that disagree with a confident rule-based value, are flagged
+     uncertain. If the LLM fails, the rule result is used and the failure is noted.
+"""
+from __future__ import annotations
+
+import logging
+import re
+
+from ..config import settings
+from . import llm as llm_mod
+from .loaders import LoadedDocument, PageText
+from .normalize import money_close, norm_invoice_number, norm_name
+from .rules import INV_NO_RE, extract_rules
+from .spreadsheet import extract_table
+from .types import HEADER_FIELDS, MONEY_FIELDS, ExtractedInvoice
+
+log = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------------ segmentation
+
+def _page_invoice_number(text: str) -> str | None:
+    for ln in text.splitlines()[:40]:
+        m = INV_NO_RE.search(ln)
+        if m:
+            return norm_invoice_number(m.group(1))
+    return None
+
+
+# A document title on its own line near the top of a page ("BILL", "TAX INVOICE", "CHALLAN", ...).
+# Not "Bill To:", "Invoice No: ..." etc.: the whole line must be the title.
+_TITLE_RE = re.compile(
+    r"(?:(?:tax|sales|commercial|proforma|pro-forma|retail|cash)\s+)?"
+    r"(?:invoice|bill|cash\s*memo|challan|delivery\s+(?:note|challan)|receipt|credit\s+note|debit\s+note)",
+    re.I,
+)
+_PAGE_OF_RE = re.compile(r"\bpage\s*(\d+)\s*(?:of|/)\s*(\d+)\b", re.I)
+# The previous page ended an invoice (totals / amount in words / signature block).
+_CLOSING_RE = re.compile(
+    r"\b(?:grand\s*total|total|amount\s*in\s*words|in\s*words|balance\s*due|due|net\s*payable|"
+    r"receiver'?s?\s*signature|authori[sz]ed\s*signature)\b", re.I)
+
+
+def _has_title_header(text: str) -> bool:
+    for ln in text.splitlines()[:15]:
+        t = re.sub(r"[^A-Za-z\s\-]", " ", ln).strip()
+        t = re.sub(r"\s+", " ", t)
+        if t and _TITLE_RE.fullmatch(t):
+            return True
+    return False
+
+
+def _page_of(text: str) -> tuple[int, int] | None:
+    m = _PAGE_OF_RE.search(text)
+    if m:
+        k, n = int(m.group(1)), int(m.group(2))
+        if 1 <= k <= n:
+            return k, n
+    return None
+
+
+def segment_pages(pages: list[PageText]) -> list[list[PageText]]:
+    """Group consecutive pages into invoices. A page starts a new invoice when:
+    1. it shows an invoice number different from the current segment's, or
+    2. (no number found, e.g. OCR lost the "Bill No." label) it says "Page 1 of N", or it starts with a
+       document title (BILL / INVOICE / CHALLAN ...) and the previous page ended with a total or signature.
+    "Page 2 of 3"-style pages and pages without these signals stay with the previous invoice."""
+    segments: list[list[PageText]] = []
+    current_no: str | None = None
+    for p in pages:
+        if not p.text.strip():
+            if segments:
+                segments[-1].append(p)
+            continue
+        no = _page_invoice_number(p.text)
+        if not segments:
+            new = True
+        elif no is not None:
+            new = no != current_no
+        else:
+            pg = _page_of(p.text)
+            if pg:
+                new = pg[0] == 1
+            else:
+                prev = segments[-1][-1].text
+                new = _has_title_header(p.text) and bool(_CLOSING_RE.search(prev))
+        if new:
+            segments.append([p])
+            current_no = no
+        else:
+            segments[-1].append(p)
+            current_no = no or current_no
+    return segments
+
+
+# ------------------------------------------------------------------ grounding
+
+def _digits(s: str) -> str:
+    return re.sub(r"\D", "", s)
+
+
+def _grounded(value, text: str, field: str) -> bool:
+    if value in (None, ""):
+        return True
+    if field in MONEY_FIELDS:
+        v = float(value)
+        candidates = {f"{v:.2f}", f"{v:,.2f}", f"{v:.2f}".replace(".", ","), f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")}
+        if v.is_integer():
+            candidates |= {str(int(v)), f"{int(v):,}"}
+        compact = text.replace(" ", "")
+        return any(c.replace(" ", "") in compact for c in candidates)
+    if field == "invoice_number":
+        return norm_invoice_number(value) in norm_invoice_number(text) if norm_invoice_number(text) else False
+    if field in ("supplier_name", "customer_name"):
+        n = norm_name(value) or ""
+        tokens = [t for t in n.split() if len(t) > 2]
+        hay = norm_name(text) or ""
+        return bool(tokens) and sum(t in hay for t in tokens) / len(tokens) >= 0.6
+    if field == "invoice_date":
+        y, m, d = value.split("-") if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) else ("", "", "")
+        return bool(y) and (y in text or y[2:] in _digits(text))
+    if field == "currency":
+        return True  # may be derived from a symbol
+    return True
+
+
+def _merge(llm_inv: ExtractedInvoice, rule_inv: ExtractedInvoice, text: str, ocr_conf: float | None,
+           vision: bool = False) -> ExtractedInvoice:
+    out = llm_inv
+    conf: dict[str, float] = {}
+    # Vision reads the image itself, so the OCR text is not a reliable reference for grounding.
+    base = 0.88 if vision else (0.95 if ocr_conf is None else min(0.95, ocr_conf + 0.05))
+    for f in HEADER_FIELDS:
+        v = getattr(out, f)
+        rv = getattr(rule_inv, f)
+        if v in (None, ""):
+            conf[f] = 0.0
+            continue
+        c = base
+        if not vision and not _grounded(v, text, f):
+            out.mark_uncertain(f, f"{f} value '{v}' not found verbatim in source text")
+            c = min(c, 0.4)
+        if rv not in (None, "") and rule_inv.confidence.get(f, 0) >= 0.8:
+            agree = money_close(float(v), float(rv)) if f in MONEY_FIELDS else (
+                norm_invoice_number(str(v)) == norm_invoice_number(str(rv)) if f == "invoice_number" else
+                (norm_name(str(v)) == norm_name(str(rv)) if f in ("supplier_name", "customer_name") else str(v) == str(rv))
+            )
+            if agree:
+                c = min(1.0, c + 0.04)
+            else:
+                c = min(c, 0.6)
+                out.mark_uncertain(f, f"LLM and rule extractor disagree on {f}: '{v}' vs '{rv}'")
+        if f in out.uncertain_fields:
+            c = min(c, 0.6)
+        conf[f] = round(c, 3)
+    out.confidence = conf
+    return out
+
+
+def extract_text_segment(text: str, ocr_conf: float | None) -> ExtractedInvoice:
+    rule_inv = extract_rules(text, ocr_conf)
+    if not settings.text_llm_available:
+        return rule_inv
+    try:
+        llm_inv = llm_mod.extract_llm(text)
+    except llm_mod.LLMError as exc:
+        log.warning("LLM extraction failed, using rules: %s", exc)
+        rule_inv.notes.append(f"LLM unavailable, rule-based fallback used: {exc}")
+        return rule_inv
+    llm_inv.source_text = text
+    return _merge(llm_inv, rule_inv, text, ocr_conf)
+
+
+def extract_image_segment(images: list[bytes], text: str, ocr_conf: float | None) -> ExtractedInvoice:
+    """Photos / scans: the vision LLM (Claude or Gemini) reads the page images (handles handwriting); rules on the OCR text are the
+    cross-check and the fallback."""
+    rule_inv = extract_rules(text, ocr_conf)
+    try:
+        llm_inv = llm_mod.extract_llm_images(images, text)
+    except llm_mod.LLMError as exc:
+        log.warning("Vision extraction failed (%s); trying text LLM", exc)
+        inv = extract_text_segment(text, ocr_conf)
+        inv.notes.append(f"Vision extraction unavailable: {exc}")
+        return inv
+    return _merge(llm_inv, rule_inv, text, ocr_conf, vision=True)
+
+
+# ------------------------------------------------------------------ entry point
+
+def extract_document(doc: LoadedDocument, progress=None) -> list[ExtractedInvoice]:
+    results: list[ExtractedInvoice] = []
+    if doc.tables:
+        for i, (name, df) in enumerate(doc.tables):
+            invs, fallback_text = extract_table(name, df, i + 1)
+            if fallback_text:
+                inv = extract_text_segment(fallback_text, None)
+                inv.page_start = inv.page_end = i + 1
+                if not inv.is_empty():
+                    invs = [inv]
+            results.extend(invs)
+            if progress:
+                progress((i + 1) / len(doc.tables), f"sheet {name}")
+        return results
+
+    segments = segment_pages(doc.pages)
+
+    def work(seg: list[PageText]) -> ExtractedInvoice:
+        text = "\n".join(p.text for p in seg)
+        confs = [p.ocr_confidence for p in seg if p.ocr_confidence is not None]
+        images = [p.image for p in seg if p.image]
+        if images and settings.llm_available and settings.llm_vision:
+            inv = extract_image_segment(images, text, min(confs) if confs else None)
+        else:
+            inv = extract_text_segment(text, min(confs) if confs else None)
+        inv.page_start, inv.page_end = seg[0].page_number, seg[-1].page_number
+        return inv
+
+    # LLM calls are network-bound: run several segments concurrently (1000-page files).
+    workers = settings.llm_concurrency if settings.provider == "anthropic" else 1  # free Gemini tier: low RPM
+    if workers > 1 and len(segments) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for i, inv in enumerate(pool.map(work, segments)):  # map keeps page order
+                if not inv.is_empty():
+                    results.append(inv)
+                if progress:
+                    progress((i + 1) / len(segments), f"invoice {i + 1}/{len(segments)}")
+    else:
+        for i, seg in enumerate(segments):
+            inv = work(seg)
+            if not inv.is_empty():
+                results.append(inv)
+            if progress:
+                progress((i + 1) / len(segments), f"invoice {i + 1}/{len(segments)}")
+    return results

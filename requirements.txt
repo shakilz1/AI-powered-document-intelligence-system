@@ -1,0 +1,22 @@
+# Runtime
+fastapi==0.165.0
+uvicorn[standard]==0.54.0
+SQLAlchemy==2.1.9
+pydantic==2.14.4
+python-multipart==0.0.34
+pymupdf==2.1
+rapidocr-onnxruntime==1.4.4
+onnxruntime==1.32.0
+pillow==13.0.0
+numpy==2.5.5
+pandas==3.1.1
+openpyxl==3.1.5
+xlrd==2.0.2
+python-dateutil==4.0.0
+anthropic==2.12.0
+httpx==0.28.1
+
+# PostgreSQL (optional, when DATABASE_URL=postgresql+psycopg://...)
+# psycopg[binary]
+# Real sentence embeddings for semantic search (optional, ~130 MB model download on first use)
+# fastembed
