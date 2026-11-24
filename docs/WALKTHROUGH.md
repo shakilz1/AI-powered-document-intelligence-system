@@ -74,7 +74,7 @@ pause the recording while long files process if you want a shorter video.
    Filters: date range + min total + "needs review".
 
 10. **API, tests and evaluation (1 min).** Show http://localhost:8000/docs, including
-    `GET /api/settings/llm`. Show `backend/test-results/pytest_output.txt` (126 passed) or run `pytest -q`.
+    `GET /api/settings/llm`. Show `backend/test-results/pytest_output.txt` (127 passed) or run `pytest -q`.
     Then the evaluation reports:
     - rules only: 99.81 % field accuracy (`backend/eval/results/evaluation_report.md`), held-out 99.87 %;
     - local LLM qwen3.5:4b: 100 % field accuracy on all 199 invoices, but ~10–16 s per page against

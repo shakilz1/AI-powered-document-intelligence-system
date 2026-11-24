@@ -94,6 +94,7 @@ input.num { text-align: right; }
 .field.conf-low input { border-left-color: var(--bad); background: var(--bad-bg); }
 .field.has-issue .flabel { color: var(--bad); }
 .flabel .auto { color: var(--info); font-weight: 400; }
+input.recalc { border-color: var(--info); background: var(--info-bg); }
 .flabel { color: var(--muted); font-weight: 600; } .conf { font-weight: 400; }
 .by { width: 190px; }
 .pagetext { white-space: pre-wrap; font-size: 12px; font-family: Consolas, ui-monospace, monospace; max-height: 420px; overflow: auto; margin: 6px 0 0; }

@@ -104,6 +104,19 @@ def test_manual_correction_revalidates_and_audits(client, rng, make_invoice):
     assert bad.status_code == 422
 
 
+def test_correction_computes_missing_line_amounts(client, rng, make_invoice):
+    """An API client may send quantity + unit price only: amount = qty × price − discount."""
+    res = _upload(client, ("lines.pdf", _pdf_bytes([make_invoice("AMT")], rng), "application/pdf"))
+    inv_row = client.get(f"/api/documents/{res['accepted'][0]['id']}").json()["invoices"][0]
+    r = client.patch(f"/api/invoices/{inv_row['id']}", json={"line_items": [
+        {"description": "CT", "quantity": 6, "unit_price": 450},                       # -> 2700
+        {"description": "Relay", "quantity": 2, "unit_price": 100, "discount_pct": 10},  # -> 180
+        {"description": "Typed", "quantity": 1, "unit_price": 5, "amount": 7},          # kept as typed
+    ]})
+    assert r.status_code == 200
+    assert [li["amount"] for li in r.json()["line_items"]] == [2700, 180, 7]
+
+
 def test_duplicate_and_cross_reference_detection(client, rng, make_invoice, tmp_path):
     inv = make_invoice("DUP")
     _upload(client, ("orig.pdf", _pdf_bytes([inv], rng), "application/pdf"))

@@ -1,9 +1,9 @@
-........................................................................ [ 57%]
-......................................................                   [100%]
+........................................................................ [ 56%]
+.......................................................                  [100%]
 ============================== warnings summary ===============================
 tests/test_spreadsheet.py::test_xls_legacy
   D:\doc-intel\doc-intel\backend\app\pipeline\loaders.py:232: Pandas4Warning: The xlrd engine is deprecated and will be removed in a future version. Use the calamine engine instead, by setting engine='calamine'.
     sheets = pd.read_excel(path, sheet_name=None, header=None, engine=engine, dtype=object)
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-126 passed, 1 warning in 26.42s
+127 passed, 1 warning in 28.89s

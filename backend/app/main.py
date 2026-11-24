@@ -315,6 +315,10 @@ def correct_invoice(inv_id: str, patch: InvoicePatch, db: Session = Depends(get_
     conf = dict(inv.confidence or {})
     for field, new in data.items():
         if field == "line_items":
+            for li in new or []:  # API clients may send qty + price only: amount = qty × price − discount
+                q, u, d = li.get("quantity"), li.get("unit_price"), li.get("discount_pct") or 0
+                if li.get("amount") is None and q is not None and u is not None:
+                    li["amount"] = round(q * u * (1 - d / 100), 2)
             old = [(li.description, li.quantity, li.unit_price, li.amount) for li in inv.line_items]
             inv.line_items = [LineItem(position=i, **li) for i, li in enumerate(new or [])]
             db.add(Correction(invoice=inv, field="line_items", old_value=str(old), new_value=str(new), corrected_by=who))
@@ -390,4 +394,6 @@ if _dist.is_dir():
     def spa(full_path: str):
         if full_path.startswith("api/"):
             raise HTTPException(404)
-        return FileResponse(_dist / "index.html")
+        # no-cache: the browser must re-check index.html, so a rebuilt UI (new hashed asset names) shows up
+        # immediately instead of an old cached version. The hashed /assets files can still be cached.
+        return FileResponse(_dist / "index.html", headers={"Cache-Control": "no-cache"})

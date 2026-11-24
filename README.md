@@ -10,7 +10,7 @@ REST API and a React web interface.
 |---|---|
 | Architecture, design decisions, DB schema | [docs/architecture.md](docs/architecture.md) |
 | Evaluation report (measured) | [backend/eval/results/evaluation_report.md](backend/eval/results/evaluation_report.md) · held-out: [results_holdout](backend/eval/results_holdout/evaluation_report.md) · local LLM: [results_ollama](backend/eval/results_ollama/evaluation_report.md) |
-| Test results | [backend/test-results/pytest_output.txt](backend/test-results/pytest_output.txt) (126 passed) |
+| Test results | [backend/test-results/pytest_output.txt](backend/test-results/pytest_output.txt) (127 passed) |
 | AI prompts & AI-assistance disclosure | [docs/AI_DISCLOSURE.md](docs/AI_DISCLOSURE.md) |
 | Walkthrough script for the recording | [docs/WALKTHROUGH.md](docs/WALKTHROUGH.md) |
 
@@ -169,7 +169,7 @@ backend/
       validation.py    validation rules
       crossverify.py   PDF<->PDF / PDF<->Excel comparison
       normalize.py     money/date/currency/name normalisation
-  tests/               126 automated tests
+  tests/               127 automated tests
   eval/                synthetic labeled dataset generator + evaluation runner + results
   scripts/             demo upload script
 frontend/              React (Vite) UI
@@ -277,13 +277,26 @@ never presented as if it had been read from the document:
 
 - **No tax on the document → tax = 0** (labeled "not on document → 0").
 - **No subtotal on the document → subtotal = sum of the line-item amounts**, only when every line has an
-  amount (labeled "= sum of amounts"). While you correct line items in the UI, a filled-in subtotal
-  updates live.
+  amount (labeled "= sum of amounts").
 
 Printed values are never overwritten. The checks still compare subtotal + tax with the printed total, so
 a misread line or an untaxed total that doesn't add up is still flagged for review. The filled-in fields
 are listed per invoice in the API (`derived_fields`). Implemented in
 `backend/app/pipeline/types.py::apply_defaults`.
+
+### Calculations while you correct an invoice
+
+In the invoice editor, values that depend on what you change are recalculated as you type:
+
+- changing **quantity, unit price or discount %** sets the line **amount** = quantity × unit price × (1 − discount %);
+- changing any line sets the **subtotal** = sum of the line amounts;
+- changing the lines, the subtotal or the tax sets the **total** = subtotal + tax.
+
+Recalculated values are highlighted and labeled "recalculated"; nothing is saved until you click
+*Save corrections*. A value you type directly into a line amount or the total is kept as typed.
+The **Recalculate** button redoes every line, the subtotal and the total in one click (useful for an
+invoice saved earlier with a stale amount). The API does the same for line items sent with quantity and
+unit price but no amount (`PATCH /api/invoices/{id}`).
 
 ## Known limitations / next steps
 

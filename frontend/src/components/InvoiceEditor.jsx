@@ -55,17 +55,76 @@ export default function InvoiceEditor({ invoice, onSaved }) {
     setSaving(false);
   }
 
-  // Subtotal not printed on the document (or filled by the system): keep it = sum of the line amounts while editing.
-  const autoSubtotal = (invoice.derived_fields || []).includes("subtotal") || invoice.subtotal == null;
-  const updateItems = (next) => {
+  // ---- live recalculation while the user corrects values
+  //   line amount = quantity × unit price × (1 − discount %)   (when qty, price or discount changes)
+  //   subtotal    = Σ line amounts                             (when any line changes)
+  //   total       = subtotal + tax                             (when lines, subtotal or tax change)
+  // Typing a total or a line amount directly is kept as typed. Recalculated fields are labelled.
+  const [recalc, setRecalc] = useState(() => new Set());
+  const num = (v) => (v === "" || v == null || Number.isNaN(Number(v)) ? null : Number(v));
+  const r2 = (n) => Math.round(n * 100) / 100;
+  const lineAmount = (li) => {
+    const q = num(li.quantity), p = num(li.unit_price), d = num(li.discount_pct) ?? 0;
+    return q == null || p == null ? null : r2(q * p * (1 - d / 100));
+  };
+  const totalsFrom = (f, nextItems) => {
+    const out = { ...f };
+    const changed = [];
+    if (nextItems) {
+      const amounts = nextItems.map((li) => num(li.amount));
+      if (amounts.length && amounts.every((a) => a != null)) {
+        out.subtotal = String(r2(amounts.reduce((a, b) => a + b, 0)));
+        changed.push("subtotal");
+      }
+    }
+    const sub = num(out.subtotal);
+    if (sub != null) {
+      out.total = String(r2(sub + (num(out.tax) ?? 0)));
+      changed.push("total");
+    }
+    return [out, changed];
+  };
+  const markRecalc = (keys) => setRecalc((s) => new Set([...s, ...keys]));
+
+  const updateItems = (next, changedLines = []) => {
     setItems(next);
     setItemsDirty(true);
-    const nums = next.map((li) => (li.amount === "" || li.amount == null ? NaN : Number(li.amount)));
-    if (autoSubtotal && nums.length && nums.every((n) => !Number.isNaN(n))) {
-      setForm((f) => ({ ...f, subtotal: String(Math.round(nums.reduce((a, b) => a + b, 0) * 100) / 100) }));
-    }
+    const [f, changed] = totalsFrom(form, next);
+    setForm(f);
+    markRecalc([...changed, ...changedLines.map((i) => `amount-${i}`)]);
   };
-  const setItem = (i, k, v) => updateItems(items.map((li, j) => (j === i ? { ...li, [k]: v } : li)));
+  const setItem = (i, k, v) => {
+    let lineChanged = [];
+    const next = items.map((li, j) => {
+      if (j !== i) return li;
+      const upd = { ...li, [k]: v };
+      if (["quantity", "unit_price", "discount_pct"].includes(k)) {
+        const a = lineAmount(upd);
+        if (a != null) { upd.amount = String(a); lineChanged = [i]; }
+      }
+      return upd;
+    });
+    if (k === "amount") setRecalc((s) => { const n = new Set(s); n.delete(`amount-${i}`); return n; });
+    updateItems(next, lineChanged);
+  };
+  // One click: amount = qty × price − discount on every line that has both, then subtotal and total.
+  const recalculateAll = () => {
+    const changedLines = [];
+    const next = items.map((li, i) => {
+      const a = lineAmount(li);
+      if (a == null || num(li.amount) === a) return li;
+      changedLines.push(i);
+      return { ...li, amount: String(a) };
+    });
+    updateItems(next, changedLines);
+  };
+  const setField = (k, v) => {
+    let f = { ...form, [k]: v };
+    let changed = [];
+    if (k === "subtotal" || k === "tax") [f, changed] = totalsFrom(f, null);
+    setForm(f);
+    setRecalc((s) => { const n = new Set([...s, ...changed]); n.delete(k); return n; });
+  };
   const errors = invoice.issues.filter((i) => i.severity === "error");
   const warnings = invoice.issues.filter((i) => i.severity === "warning");
   const infos = invoice.issues.filter((i) => i.severity === "info");
@@ -100,9 +159,12 @@ export default function InvoiceEditor({ invoice, onSaved }) {
                   <span className="auto" title={k === "tax" ? "No tax on the document, so tax is 0" : "Not printed on the document: sum of the line amounts"}>
                     {k === "tax" ? " · not on document → 0" : " · = sum of amounts"}</span>
                 )}
+                {recalc.has(k) && (
+                  <span className="auto" title={k === "total" ? "subtotal + tax" : "sum of the line amounts"}> · recalculated</span>
+                )}
               </span>
               <input type={type === "number" ? "text" : type} inputMode={type === "number" ? "decimal" : undefined}
-                value={form[k] ?? ""} placeholder="not found" onChange={(e) => setForm({ ...form, [k]: e.target.value })} />
+                value={form[k] ?? ""} placeholder="not found" onChange={(e) => setField(k, e.target.value)} />
             </label>
           );
         })}
@@ -117,7 +179,9 @@ export default function InvoiceEditor({ invoice, onSaved }) {
               <td><input className="num" value={li.quantity ?? ""} onChange={(e) => setItem(i, "quantity", e.target.value)} /></td>
               <td><input className="num" value={li.unit_price ?? ""} onChange={(e) => setItem(i, "unit_price", e.target.value)} /></td>
               <td><input className="num" value={li.discount_pct ?? ""} onChange={(e) => setItem(i, "discount_pct", e.target.value)} /></td>
-              <td><input className="num" value={li.amount ?? ""} onChange={(e) => setItem(i, "amount", e.target.value)} /></td>
+              <td><input className={`num ${recalc.has(`amount-${i}`) ? "recalc" : ""}`} value={li.amount ?? ""}
+                title={recalc.has(`amount-${i}`) ? "Recalculated: quantity × unit price − discount" : undefined}
+                onChange={(e) => setItem(i, "amount", e.target.value)} /></td>
               <td><button className="small" onClick={() => updateItems(items.filter((_, j) => j !== i))}>✕</button></td>
             </tr>
           ))}
@@ -126,6 +190,9 @@ export default function InvoiceEditor({ invoice, onSaved }) {
       </table>
       <div className="toolbar">
         <button className="small" onClick={() => { setItems([...items, { description: "", quantity: "", unit_price: "", discount_pct: "", amount: "" }]); setItemsDirty(true); }}>+ Line item</button>
+        <button className="small" onClick={recalculateAll} disabled={!items.length}
+          title="Line amount = quantity × unit price − discount; subtotal = sum of amounts; total = subtotal + tax">
+          Recalculate</button>
         <div className="spacer" />
         <input className="by" placeholder="Your name (audit log)" value={by} onChange={(e) => setBy(e.target.value)} />
         <button disabled={!dirty || saving} onClick={() => save(false)}>Save corrections</button>
